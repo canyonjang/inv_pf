@@ -50,6 +50,12 @@ def _num(x):
 # 국내 — KRX 전종목 일괄
 # ==================================================================
 KRX_URL = "https://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
+
+# KRX 일괄 조회는 요청 3회로 국내 전종목을 받을 수 있어 효율적이지만,
+# 클라우드 환경에서 400 을 돌려주는 경우가 있다. 네이버 경로가 전량을
+# 커버하므로 기본값은 꺼 둔다. 나중에 KRX 가 다시 열리면 True 로 바꾸면 된다.
+USE_KRX_BULK = False
+
 KRX_HEADERS = {
     "User-Agent": UA,
     "Referer": "https://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd",
@@ -311,14 +317,14 @@ def fetch_all(target: date):
 
     prices = {}
 
-    # 1) 국내 일괄
-    prices.update(_fetch_krx_bulk(target, log))
+    # 1) 국내 일괄 (KRX). 기본값은 꺼져 있고 네이버가 전량을 담당한다.
+    if USE_KRX_BULK:
+        prices.update(_fetch_krx_bulk(target, log))
 
-    # 2) 빠진 국내 종목만 네이버로 보충
+    # 2) 빠진 국내 종목을 네이버로 수집
     need = [t for t in kr if t not in prices]
     want_kospi = "BENCH-KOSPI" not in prices
     if need or want_kospi:
-        log(f"KRX에서 {len(need)}종목이 비어 네이버로 보충합니다.")
         syms = need + (["KOSPI"] if want_kospi else [])
         for k, v in _fetch_naver_many(syms, target, log).items():
             prices["BENCH-KOSPI" if k == "KOSPI" else k] = v

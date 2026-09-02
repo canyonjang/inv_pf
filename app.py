@@ -21,7 +21,8 @@ import pandas as pd
 import streamlit as st
 from supabase import Client, create_client
 
-from universe import (SEC_MAP, TRADABLE, group_of, is_high_risk, label)
+from universe import (ALL_TICKERS, SEC_MAP, TRADABLE, group_of, is_high_risk,
+                      label)
 from price_fetcher import fetch_all, previous_business_day
 
 st.set_page_config(page_title="투자 포트폴리오", page_icon="📈", layout="wide")
@@ -695,13 +696,40 @@ else:
     st.caption("이 버튼을 누를 때만 외부 시세를 불러옵니다. "
                "수업 시작 전에 한 번, 체결 전날 밤에 한 번 누르시면 됩니다.")
 
+    # ---- 항상 보이는 저장 현황 (DB에서 직접 읽으므로 화면 재실행과 무관) ----
+    all_tk = [t for t, *_ in ALL_TICKERS]
+    saved_tk = set()
+    saved_fx = None
+    if last_pd and not pdf.empty:
+        day = pdf[pdf["price_date"] == last_pd]
+        saved_tk = set(day["ticker"])
+        fxs = day["fx_usdkrw"].dropna()
+        saved_fx = float(fxs.iloc[0]) if len(fxs) else None
+    miss_db = [t for t in all_tk if t not in saved_tk]
+
+    s1, s2, s3 = st.columns(3)
+    s1.metric("저장된 기준일", last_pd.isoformat() if last_pd else "없음")
+    s2.metric("저장된 종가", f"{len(saved_tk)} / {len(all_tk)} 종목")
+    s3.metric("적용 환율", f"{saved_fx:,.2f} 원" if saved_fx else "없음")
+
+    if last_pd and not miss_db:
+        st.success("이 기준일의 모든 종목이 저장되어 있습니다. 바로 수업을 시작하셔도 됩니다.")
+    elif last_pd:
+        st.warning(f"{len(miss_db)}개 종목이 비어 있습니다: "
+                   + ", ".join(SEC_MAP.get(t, {}).get("name", t) for t in miss_db[:15])
+                   + (" 외" if len(miss_db) > 15 else ""))
+    else:
+        st.info("아직 기준가를 불러온 적이 없습니다. 아래 버튼을 눌러 시작하세요.")
+
+    st.write("")
+
     g1, g2 = st.columns([3, 2])
     target = g1.date_input("기준일 (기본: 전 영업일)", value=previous_business_day())
     go = g2.button("📥 전일 종가 불러오기", type="primary", use_container_width=True)
 
     if go:
         with st.spinner("시세를 불러오는 중입니다. 30~60초 걸립니다..."):
-            rows, fx, logs, missing, missing_tk = fetch_all(target)
+            rows, fx, logs, missing, _miss_tk = fetch_all(target)
 
         # 환율을 못 가져왔으면 가장 최근에 저장된 환율을 그대로 쓴다.
         if not fx and not pdf.empty:
@@ -744,25 +772,20 @@ else:
                        + (f" · 환율 {fx:,.2f}원" if fx else ""))
             if missing:
                 st.warning("수집 실패: " + ", ".join(missing))
-                st.session_state["missing_tickers"] = missing_tk
-                st.session_state["missing_date"] = target.isoformat()
-            else:
-                st.session_state.pop("missing_tickers", None)
             for l in logs:
                 st.caption(l)
             st.info("화면 상단의 [현황 새로고침]을 눌러 반영된 결과를 보세요.")
 
     # ---------------- 수동 보정 (자동 수집 실패 시) ----------------
-    miss = st.session_state.get("missing_tickers") or []
+    miss = miss_db
     with st.expander(f"✍️ 종가 직접 입력 {'· 보정 필요 ' + str(len(miss)) + '건' if miss else ''}",
                      expanded=bool(miss)):
         st.caption("자동 수집이 실패한 종목은 여기에 직접 넣으면 됩니다. "
                    "네이버·야후에서 해당 날짜 종가를 보고 그대로 입력하세요. "
                    "해외 종목은 **달러 가격 그대로** 넣으면 환율이 자동 적용됩니다.")
 
-        mdate = st.date_input("보정할 기준일", value=datetime.strptime(
-            st.session_state.get("missing_date", target.isoformat()),
-            "%Y-%m-%d").date(), key="mdate")
+        mdate = st.date_input("보정할 기준일",
+                              value=last_pd or previous_business_day(), key="mdate")
 
         pool = miss if miss else TRADABLE + ["BENCH-KOSPI", "BENCH-SP500"]
         chosen = st.multiselect("입력할 종목", pool, default=miss[:12],
@@ -814,8 +837,6 @@ else:
                     supabase.table("inv_pf_snapshots").upsert(
                         srows, on_conflict="class_name,name,price_date").execute()
                 set_status(my_class, last_price_date=mdate.isoformat())
-                st.session_state["missing_tickers"] = [
-                    t for t in miss if t not in {r["ticker"] for r in mrows}]
                 clear_all_cache()
                 st.success(f"{len(mrows)}건 저장 완료 · 평가금액 재계산")
                 st.rerun()
