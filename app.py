@@ -333,7 +333,20 @@ if st.session_state.role == "student":
             st.dataframe(disp, use_container_width=True, hide_index=True)
             hr = sum(r["value"] or 0 for r in rows if is_high_risk(r["ticker"]))
             st.caption(f"고위험자산 비중 {hr/total*100:.1f}% (상한 20%) · "
+                       f"현금 비중 {cash/total*100:.1f}% · "
                        f"기준가 {last_pd.isoformat() if last_pd else '—'}")
+
+        with st.expander("💵 현금을 남겨두는 것도 하나의 결정입니다"):
+            st.markdown(
+                "- 현금은 **수익률 0%인 자산**입니다. 오르지도 내리지도 않습니다.\n"
+                "- 시장이 내리면 전체 손실을 줄여주고, 오르면 그만큼 못 법니다. "
+                "이것이 현금의 **기회비용**입니다.\n"
+                "- 하락에 베팅하는 인버스와는 다릅니다. 인버스는 방향을 맞히면 벌지만 "
+                "**틀리면 잃습니다.** 현금은 방향을 걸지 않습니다.\n"
+                "- 다음 라운드에 살 수 있는 여력이기도 합니다. "
+                "현금이 0이면 사고 싶은 게 생겨도 무언가를 팔아야 합니다.\n"
+                "- 얼마를 현금으로 둘지에 **정답은 없습니다.** 다만 "
+                "왜 그 비중인지 설명할 수 있어야 하고, 그 설명이 기말 보고서의 재료가 됩니다.")
 
     st.write("---")
 
@@ -584,13 +597,19 @@ if st.session_state.role == "student":
 
     # ---------------- 다운로드 ----------------
     st.write("---")
-    st.subheader("④ 기말 보고서용 기록 내려받기")
-    st.caption("휴대폰에서도 바로 저장됩니다. 파일을 열어 발표자료에 붙여 쓰세요.")
+    st.subheader("④ 나의 매매 기록 내려받기")
+    st.caption("휴대폰에서도 바로 저장됩니다. **기말 보고서는 이 기록을 근거로 직접 작성하세요.**")
 
+    round_name = {k: v[0] for k, v in ROUNDS.items()}
+    refl_by_round = {r["round_no"]: r for r in refl_rows}
+
+    # 거래내역 — 각 줄에 그 라운드에 내가 적었던 심정·이유를 함께 붙인다
     trade_rows = []
     for o in sorted(my_orders, key=lambda x: (x["round_no"], x["id"])):
+        rf = refl_by_round.get(o["round_no"], {})
         trade_rows.append({
             "라운드": o["round_no"],
+            "라운드명": round_name.get(o["round_no"], ""),
             "구분": "매수" if o["side"] == "buy" else "매도",
             "종목": SEC_MAP.get(o["ticker"], {}).get("name", o["ticker"]),
             "티커": o["ticker"],
@@ -600,7 +619,9 @@ if st.session_state.role == "student":
             "체결수량": o.get("exec_qty"),
             "체결일": o.get("exec_date"),
             "상태": o.get("status"),
-            "제출시각": o.get("submitted_at"),
+            "주문제출시각": o.get("submitted_at"),
+            "그때의 심정": rf.get("feeling"),
+            "결정 이유": rf.get("reason"),
         })
     trades_df = pd.DataFrame(trade_rows)
 
@@ -611,53 +632,29 @@ if st.session_state.role == "student":
         "수익률(%)": round((float(s["total_value"]) / INITIAL_CAPITAL - 1) * 100, 2),
     } for s in sorted(snaps, key=lambda x: x["price_date"])])
 
+    # 라운드별 기록 — 거래가 없던 라운드도 빠짐없이 남긴다
     refl_df = pd.DataFrame([{
         "라운드": r["round_no"],
+        "라운드명": round_name.get(r["round_no"], ""),
+        "거래없음": r.get("no_trade"),
         "그때의 심정": r.get("feeling"),
         "결정 이유": r.get("reason"),
-        "거래없음": r.get("no_trade"),
         "제출시각": r.get("submitted_at"),
     } for r in sorted(refl_rows, key=lambda x: x["round_no"])])
 
     buf = io.StringIO()
-    buf.write(f"# {me} 투자 기록\n\n## 1. 거래내역\n")
+    buf.write(f"# {me} 매매 기록\n\n## 1. 거래내역 (라운드별 심정·이유 포함)\n")
     buf.write(trades_df.to_csv(index=False) if not trades_df.empty else "(없음)\n")
     buf.write("\n## 2. 주차별 평가금액\n")
     buf.write(snap_df.to_csv(index=False) if not snap_df.empty else "(없음)\n")
-    buf.write("\n## 3. 라운드별 기록\n")
+    buf.write("\n## 3. 라운드별 내가 적은 기록\n")
     buf.write(refl_df.to_csv(index=False) if not refl_df.empty else "(없음)\n")
 
-    d1, d2 = st.columns(2)
-    d1.download_button("📥 전체 기록 (CSV)", buf.getvalue().encode("utf-8-sig"),
-                       file_name=f"투자기록_{me}.csv", mime="text/csv",
-                       use_container_width=True)
-
-    md = io.StringIO()
-    md.write(f"# {me} · 6주 투자 기록\n\n")
-    if not snap_df.empty:
-        fin = snap_df.iloc[-1]
-        md.write(f"- 최종 평가금액: {float(fin['평가금액(만원)']):,.1f}만원 "
-                 f"({float(fin['수익률(%)']):+.2f}%)\n")
-        vals = snap_df["평가금액(만원)"].astype(float)
-        peak = vals.cummax()
-        mdd = ((vals - peak) / peak).min() * 100
-        md.write(f"- 최대낙폭(MDD): {mdd:.2f}%\n\n")
-    for r in sorted(refl_rows, key=lambda x: x["round_no"]):
-        nm = ROUNDS.get(r["round_no"], (f"라운드 {r['round_no']}", ""))[0]
-        md.write(f"## 라운드 {r['round_no']} · {nm}\n")
-        md.write(f"**그때의 심정**\n\n{r.get('feeling') or '—'}\n\n")
-        md.write(f"**결정 이유**\n\n{r.get('reason') or '—'}\n\n")
-        for o in [x for x in my_orders if x["round_no"] == r["round_no"]]:
-            if o["side"] == "buy":
-                md.write(f"- 매수 {SEC_MAP.get(o['ticker'],{}).get('name',o['ticker'])} "
-                         f"{o['amount_manwon']:,.0f}만원\n")
-            else:
-                md.write(f"- 매도 {SEC_MAP.get(o['ticker'],{}).get('name',o['ticker'])} "
-                         f"보유분의 {float(o['sell_ratio'])*100:.0f}%\n")
-        md.write("\n")
-    d2.download_button("📥 보고서 초안 (Markdown)", md.getvalue().encode("utf-8"),
-                       file_name=f"투자기록_{me}.md", mime="text/markdown",
-                       use_container_width=True)
+    st.download_button("📥 나의 매매 기록 (CSV)", buf.getvalue().encode("utf-8-sig"),
+                       file_name=f"매매기록_{me}.csv", mime="text/csv",
+                       type="primary", use_container_width=True)
+    st.caption("거래내역, 주차별 평가금액, 그리고 라운드마다 내가 적었던 심정과 "
+               "결정 이유가 모두 들어 있습니다.")
 
 
 # ==========================================================
@@ -721,11 +718,47 @@ else:
     else:
         st.info("아직 기준가를 불러온 적이 없습니다. 아래 버튼을 눌러 시작하세요.")
 
+    # ---- 저장된 종가만으로 평가금액을 다시 계산 (외부 시세 호출 없음) ----
+    def recompute_snapshots(on_date) -> int:
+        """보유내역이 바뀌었을 때(예: 체결 직후) 부른다.
+        시세를 새로 받지 않고 이미 저장된 종가를 그대로 쓴다."""
+        _q_orders.clear()
+        _q_prices.clear()
+        orders_now = _q_orders(my_class)
+        pm = price_map_on(price_table(), on_date)
+        rows_ = []
+        for s in _q_students(my_class):
+            so = student_orders(orders_now, s["name"])
+            if not so:
+                continue
+            q_, c_ = positions_from(so)
+            _, tot_ = valuate(q_, c_, pm)
+            rows_.append({"class_name": my_class, "name": s["name"],
+                          "price_date": on_date.isoformat(),
+                          "total_value": round(tot_, 4), "cash": round(c_, 4)})
+        if rows_:
+            supabase.table("inv_pf_snapshots").upsert(
+                rows_, on_conflict="class_name,name,price_date").execute()
+        _q_snapshots.clear()
+        return len(rows_)
+
+    if last_pd:
+        if st.button("🔄 평가금액만 다시 계산 (시세 재수집 없음)"):
+            n_ = recompute_snapshots(last_pd)
+            clear_all_cache()
+            st.success(f"학생 {n_}명의 평가금액을 {last_pd} 종가로 다시 계산했습니다.")
+
     st.write("")
 
     g1, g2 = st.columns([3, 2])
     target = g1.date_input("기준일 (기본: 전 영업일)", value=previous_business_day())
     go = g2.button("📥 전일 종가 불러오기", type="primary", use_container_width=True)
+
+    if last_pd and target < last_pd:
+        st.warning(f"선택한 기준일({target})이 저장된 기준일({last_pd})보다 과거입니다. "
+                   "체결가와 평가금액은 정상 계산되지만, 학생 화면의 수익률 그래프는 "
+                   "날짜순으로 그려지므로 순서가 뒤엉켜 보입니다. "
+                   "테스트 중이라면 상관없고, 학기 중에는 날짜를 앞으로만 진행하세요.")
 
     if go:
         with st.spinner("시세를 불러오는 중입니다. 30~60초 걸립니다..."):
@@ -787,10 +820,22 @@ else:
         mdate = st.date_input("보정할 기준일",
                               value=last_pd or previous_business_day(), key="mdate")
 
-        pool = miss if miss else TRADABLE + ["BENCH-KOSPI", "BENCH-SP500"]
-        chosen = st.multiselect("입력할 종목", pool, default=miss[:12],
+        # 기본은 '아직 수집되지 않은 종목'만 보여준다.
+        # 이미 저장된 값을 고칠 일이 있을 때만 전체를 연다.
+        edit_all = st.checkbox("이미 저장된 종가도 수정하기", value=False, key="medit")
+        if edit_all:
+            pool = [t for t, *_ in ALL_TICKERS]
+            default = []
+        elif miss:
+            pool = miss
+            default = miss[:12]
+        else:
+            pool, default = [], []
+            st.success("이 기준일은 모든 종목이 저장되어 있습니다. 직접 입력할 것이 없습니다.")
+
+        chosen = st.multiselect("입력할 종목", pool, default=default,
                                 format_func=lambda t: SEC_MAP.get(t, {}).get("name", t),
-                                key="mtk")
+                                key="mtk") if pool else []
 
         cur_fx = None
         if not pdf.empty:
@@ -926,12 +971,14 @@ else:
                     supabase.table("inv_pf_orders").upsert(
                         updates, on_conflict="id").execute()
                 clear_all_cache()
+                n_snap = recompute_snapshots(last_pd)     # 체결 결과 즉시 반영
+                clear_all_cache()
                 st.success(f"라운드 {exec_round} 체결 완료 — {len(updates)}건 "
-                           f"(기준가 {last_pd})")
+                           f"(기준가 {last_pd}) · 학생 {n_snap}명 평가금액 갱신")
                 if skipped:
                     st.warning("체결 불가로 취소: " + ", ".join(skipped[:20]))
-                st.info("[현황 새로고침]을 누른 뒤 기준가 업데이트를 다시 실행하면 "
-                        "평가금액에 반영됩니다.")
+                st.info("체결과 평가금액 반영이 모두 끝났습니다. "
+                        "학생들은 [화면 새로고침]을 누르면 바뀐 포트폴리오를 볼 수 있습니다.")
 
     st.write("---")
 
@@ -1091,11 +1138,34 @@ else:
                            file_name=f"{my_class}_전체데이터.csv", mime="text/csv")
 
         st.write("")
-        confirm = st.text_input("초기화하려면 분반 이름을 그대로 입력하세요", key="delconf")
-        if st.button("이 분반 전체 초기화") and confirm == my_class:
-            for tbl in ("inv_pf_orders", "inv_pf_reflections",
-                        "inv_pf_snapshots", "inv_pf_students"):
-                supabase.table(tbl).delete().eq("class_name", my_class).execute()
-            set_status(my_class, current_round=0, phase="대기", last_price_date=None)
+        st.markdown("**초기화**")
+        st.caption("되돌릴 수 없습니다. 위에서 데이터를 먼저 내려받아 두세요.")
+
+        wipe_prices = st.checkbox(
+            "종가 데이터(inv_pf_prices)도 함께 삭제 — **전 분반 공용**", key="wp")
+        wipe_all = st.checkbox(
+            "세 분반 전체를 초기화 (인하대 · 숙대1 · 숙대2)", key="wa")
+
+        scope = "전 분반" if wipe_all else my_class
+        st.caption(f"삭제 범위: **{scope}**의 주문 · 라운드기록 · 평가금액 · 학생명단"
+                   + (" + 종가 데이터 전체" if wipe_prices else ""))
+
+        confirm = st.text_input(
+            f"초기화하려면 아래 칸에 `{my_class}` 를 그대로 입력하세요", key="delconf")
+
+        if st.button("🗑️ 초기화 실행", type="primary", disabled=(confirm != my_class)):
+            targets = CLASSES if wipe_all else [my_class]
+            for cn in targets:
+                for tbl in ("inv_pf_orders", "inv_pf_reflections",
+                            "inv_pf_snapshots", "inv_pf_students"):
+                    supabase.table(tbl).delete().eq("class_name", cn).execute()
+                set_status(cn, current_round=0, phase="대기", last_price_date=None)
+
+            if wipe_prices:
+                # 전체 삭제. 조건 없는 delete 는 막혀 있으므로 항상 참인 조건을 준다.
+                supabase.table("inv_pf_prices").delete().neq("ticker", "").execute()
+
             clear_all_cache()
+            st.success(f"{scope} 초기화 완료"
+                       + (" · 종가 데이터도 삭제했습니다." if wipe_prices else ""))
             st.rerun()
