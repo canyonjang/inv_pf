@@ -360,14 +360,18 @@ if st.session_state.role == "student":
             st.error("**제출은 한 번뿐입니다.** 제출 후에는 수정할 수 없습니다.")
             st.caption("체결가는 지금 보이는 가격이 아니라 **다음 기준가 업데이트 시점의 종가**입니다.")
 
-            feeling = st.text_area(
-                "먼저 — 지금 이 화면을 보고 든 생각을 한두 문장으로 적어주세요. *(필수)*",
-                height=80, key=f"feel{rnd}",
-                placeholder="예: 반도체가 많이 빠져서 불안한데, 팔아야 할지 더 사야 할지 모르겠다.")
+            # 라운드 1은 최초 매수라 '지금 화면을 보고 든 생각'이 성립하지 않는다.
+            # 2~5 라운드에서만 손익을 본 직후의 반응을 받는다.
+            feeling = ""
+            if rnd != 1:
+                feeling = st.text_area(
+                    "먼저 — 지금 이 화면을 보고 든 생각을 한두 문장으로 적어주세요. *(필수)*",
+                    height=80, key=f"feel{rnd}",
+                    placeholder="예: 반도체가 많이 빠져서 불안한데, 팔아야 할지 더 사야 할지 모르겠다.")
 
             # 심정을 적기 전에는 주문 화면이 열리지 않는다.
             # (st.stop() 을 쓰지 않으므로 아래 기록·다운로드 영역은 그대로 보인다)
-            if not feeling.strip():
+            if rnd != 1 and not feeling.strip():
                 st.info("위 칸을 채우면 주문 화면이 열립니다.")
 
             # ---------- 라운드 1: 최초 배분 ----------
@@ -426,7 +430,7 @@ if st.session_state.role == "student":
                         supabase.table("inv_pf_orders").insert(payload).execute()
                         supabase.table("inv_pf_reflections").upsert({
                             "class_name": my_class, "name": me, "round_no": rnd,
-                            "feeling": feeling.strip(), "reason": reason.strip(),
+                            "feeling": feeling.strip() or None, "reason": reason.strip(),
                             "no_trade": False,
                         }, on_conflict="class_name,name,round_no").execute()
                         clear_all_cache()
@@ -759,6 +763,24 @@ else:
                     if o["round_no"] == exec_round:
                         by_student.setdefault(o["name"], []).append(o)
 
+                # upsert 는 INSERT ... ON CONFLICT 이므로 NOT NULL 컬럼이 모두
+                # 들어 있어야 하고, 모든 행의 키 집합이 같아야 한다.
+                def make_row(o, status, px=None, qty=None):
+                    return {
+                        "id": o["id"],
+                        "class_name": o["class_name"],
+                        "name": o["name"],
+                        "round_no": o["round_no"],
+                        "ticker": o["ticker"],
+                        "side": o["side"],
+                        "amount_manwon": o.get("amount_manwon"),
+                        "sell_ratio": o.get("sell_ratio"),
+                        "exec_price_krw": round(px, 4) if px else None,
+                        "exec_qty": round(qty, 8) if qty else None,
+                        "exec_date": last_pd.isoformat() if status == "executed" else None,
+                        "status": status,
+                    }
+
                 for sname, olist in by_student.items():
                     so = student_orders(all_orders, sname)
                     q, csh = positions_from(so, upto_round=exec_round - 1)
@@ -769,15 +791,12 @@ else:
                         held = q.get(o["ticker"], 0.0)
                         if not px or held <= 0:
                             skipped.append(f"{sname}/{label(o['ticker'])} 매도")
-                            updates.append({"id": o["id"], "status": "cancelled"})
+                            updates.append(make_row(o, "cancelled"))
                             continue
                         dq = held * float(o["sell_ratio"])
                         q[o["ticker"]] = held - dq
                         csh += dq * px / 10000
-                        updates.append({"id": o["id"], "status": "executed",
-                                        "exec_price_krw": round(px, 4),
-                                        "exec_qty": round(dq, 8),
-                                        "exec_date": last_pd.isoformat()})
+                        updates.append(make_row(o, "executed", px, dq))
 
                     # (2) 매수 — 현금이 모자라면 비율대로 축소
                     blist = [x for x in olist if x["side"] == "buy"]
@@ -795,17 +814,15 @@ else:
                         amt = float(o["amount_manwon"] or 0) * scale
                         if not px or amt <= 0:
                             skipped.append(f"{sname}/{label(o['ticker'])} 매수")
-                            updates.append({"id": o["id"], "status": "cancelled"})
+                            updates.append(make_row(o, "cancelled"))
                             continue
                         eq = amt * 10000 / px
                         csh -= amt
-                        updates.append({"id": o["id"], "status": "executed",
-                                        "exec_price_krw": round(px, 4),
-                                        "exec_qty": round(eq, 8),
-                                        "exec_date": last_pd.isoformat()})
+                        updates.append(make_row(o, "executed", px, eq))
 
                 if updates:
-                    supabase.table("inv_pf_orders").upsert(updates).execute()
+                    supabase.table("inv_pf_orders").upsert(
+                        updates, on_conflict="id").execute()
                 clear_all_cache()
                 st.success(f"라운드 {exec_round} 체결 완료 — {len(updates)}건 "
                            f"(기준가 {last_pd})")

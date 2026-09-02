@@ -1,198 +1,272 @@
 """
-종가 수집 모듈
---------------
+종가 수집 모듈 (외부 라이브러리 없음)
+-------------------------------------
+pykrx / yfinance 를 쓰지 않습니다. requests 만으로 직접 받아옵니다.
+Streamlit Cloud 의 파이썬 버전이 올라가도 빌드가 깨지지 않습니다.
+
+수집 소스
+    국내 주식·ETF  : KRX 공개 JSON (전종목 일괄, 요청 2회)
+                     → 빠진 종목만 네이버 금융으로 보충
+    코스피지수     : KRX 지수 시세 → 실패 시 네이버
+    해외 주식·ETF  : Stooq CSV
+    S&P500 · 환율  : Stooq CSV → 환율은 실패 시 네이버
+    가상자산       : 업비트 공개 API
+
 교수 화면의 [기준가 업데이트] 버튼을 눌렀을 때만 호출됩니다.
-자동 실행·주기적 폴링은 어디에도 없습니다.
-
-수집 소스 (모두 무료 · API 키 불필요)
-    국내 주식·ETF, 코스피지수 : pykrx  (한국거래소)
-    해외 주식·ETF, S&P500, 환율 : yfinance
-    가상자산                    : 업비트 공개 API
-
-호출 1회당 외부 요청 수
-    pykrx  2~3회 (전 종목을 통째로 받아 필요한 것만 골라 씀)
-    yfinance 2회 (해외 종목 일괄 + 지수/환율)
-    업비트  종목 수만큼 (보통 4회)
 """
 
+import json
+import time
 from datetime import date, timedelta
 
 import requests
 
-from universe import ALL_TICKERS, SEC_MAP
+from universe import ALL_TICKERS
+
+TIMEOUT = 15
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
 
 # ------------------------------------------------------------------
-# 기준일 계산
+# 기준일
 # ------------------------------------------------------------------
 def previous_business_day(base: date | None = None) -> date:
-    """전일(주말이면 직전 금요일)을 돌려준다."""
     d = (base or date.today()) - timedelta(days=1)
     while d.weekday() >= 5:          # 5=토, 6=일
         d -= timedelta(days=1)
     return d
 
 
-# ------------------------------------------------------------------
-# 국내 (pykrx)
-# ------------------------------------------------------------------
-def _fetch_krx(codes, target: date, log):
-    result = {}
-    if not codes:
-        return result
+def _num(x):
+    """'70,000' → 70000.0"""
     try:
-        from pykrx import stock
-    except ImportError:
-        log("pykrx 미설치 — 국내 종목 수집 건너뜀")
-        return result
+        return float(str(x).replace(",", "").strip())
+    except Exception:
+        return None
 
+
+# ==================================================================
+# 국내 — KRX 전종목 일괄
+# ==================================================================
+KRX_URL = "http://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
+KRX_HEADERS = {
+    "User-Agent": UA,
+    "Referer": "http://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd",
+    "X-Requested-With": "XMLHttpRequest",
+}
+
+
+def _krx_post(payload, log):
+    try:
+        r = requests.post(KRX_URL, data=payload, headers=KRX_HEADERS, timeout=TIMEOUT)
+        r.raise_for_status()
+        return r.json()
+    except Exception as exc:
+        log(f"KRX 요청 실패: {exc}")
+        return None
+
+
+def _fetch_krx_bulk(target: date, log):
+    """주식 전종목 + ETF 전종목 + 코스피지수를 요청 3회로 받는다."""
     ymd = target.strftime("%Y%m%d")
+    out = {}
 
-    for fn_name in ("get_market_ohlcv", "get_etf_ohlcv_by_ticker"):
-        fn = getattr(stock, fn_name, None)
-        if fn is None:
+    jobs = [
+        ({"bld": "dbms/MDC/STAT/standard/MDCSTAT01501", "mktId": "ALL",
+          "trdDd": ymd, "share": "1", "money": "1", "csvxls_isNo": "false"}, "주식"),
+        ({"bld": "dbms/MDC/STAT/standard/MDCSTAT04301",
+          "trdDd": ymd, "share": "1", "money": "1", "csvxls_isNo": "false"}, "ETF"),
+    ]
+    for payload, tag in jobs:
+        data = _krx_post(payload, log)
+        if not data:
             continue
-        try:
-            df = fn(ymd)
-        except Exception as exc:
-            log(f"KRX {fn_name} 실패: {exc}")
-            continue
-        if df is None or df.empty:
-            continue
-        for code in codes:
-            if code in result:
-                continue
-            if code in df.index:
-                try:
-                    close = float(df.loc[code, "종가"])
-                except Exception:
-                    continue
-                if close > 0:
-                    result[code] = close
+        rows = data.get("OutBlock_1") or data.get("output") or []
+        if not rows:
+            log(f"KRX {tag} 응답이 비어 있습니다 (휴장일일 수 있습니다)")
+        for row in rows:
+            code = (row.get("ISU_SRT_CD") or "").strip()
+            close = _num(row.get("TDD_CLSPRC"))
+            if code and close and close > 0:
+                out[code] = close
 
-    # 코스피 지수
-    try:
-        idx = stock.get_index_ohlcv(ymd, ymd, "1001")
-        if idx is not None and not idx.empty:
-            result["BENCH-KOSPI"] = float(idx.iloc[-1]["종가"])
-    except Exception as exc:
-        log(f"코스피지수 수집 실패: {exc}")
-
-    return result
-
-
-# ------------------------------------------------------------------
-# 해외 (yfinance)
-# ------------------------------------------------------------------
-def _fetch_yahoo(tickers, target: date, log):
-    """해외 종목 + S&P500 + 원달러 환율을 두 번의 요청으로 받는다."""
-    result, fx = {}, None
-    try:
-        import yfinance as yf
-    except ImportError:
-        log("yfinance 미설치 — 해외 종목 수집 건너뜀")
-        return result, fx
-
-    start = (target - timedelta(days=12)).isoformat()
-    end = (target + timedelta(days=1)).isoformat()
-
-    def last_close(df, col=None):
-        try:
-            s = df[col]["Close"] if col else df["Close"]
-            s = s.dropna()
-            return float(s.iloc[-1]) if len(s) else None
-        except Exception:
-            return None
-
-    # (1) 해외 개별 종목 일괄
-    if tickers:
-        try:
-            data = yf.download(" ".join(tickers), start=start, end=end,
-                               progress=False, auto_adjust=False,
-                               group_by="ticker", threads=False)
-            for t in tickers:
-                v = last_close(data, t if len(tickers) > 1 else None)
+    idx = _krx_post({"bld": "dbms/MDC/STAT/standard/MDCSTAT00101",
+                     "idxIndMidclssCd": "01", "trdDd": ymd,
+                     "share": "1", "money": "1", "csvxls_isNo": "false"}, log)
+    if idx:
+        for row in (idx.get("OutBlock_1") or []):
+            if (row.get("IDX_NM") or "").strip() in ("코스피", "KOSPI"):
+                v = _num(row.get("CLSPRC_IDX"))
                 if v:
-                    result[t] = v
-        except Exception as exc:
-            log(f"해외 종목 수집 실패: {exc}")
+                    out["BENCH-KOSPI"] = v
+                break
 
-    # (2) 지수 + 환율 일괄
+    return out
+
+
+# ==================================================================
+# 국내 — 네이버 금융 (KRX 실패분 보충)
+# ==================================================================
+def _fetch_naver_one(symbol: str, target: date, log):
+    """네이버 일별 시세에서 기준일 이하 마지막 종가를 가져온다."""
+    start = (target - timedelta(days=15)).strftime("%Y%m%d")
+    end = target.strftime("%Y%m%d")
+    url = ("https://api.finance.naver.com/siseJson.naver"
+           f"?symbol={symbol}&requestType=1&startTime={start}"
+           f"&endTime={end}&timeframe=day")
     try:
-        data2 = yf.download("^GSPC USDKRW=X", start=start, end=end,
-                            progress=False, auto_adjust=False,
-                            group_by="ticker", threads=False)
-        v = last_close(data2, "^GSPC")
-        if v:
-            result["BENCH-SP500"] = v
-        fx = last_close(data2, "USDKRW=X")
+        r = requests.get(url, headers={"User-Agent": UA}, timeout=TIMEOUT)
+        r.raise_for_status()
+        rows = json.loads(r.text.replace("'", '"').strip())
+        for row in reversed(rows[1:]):          # 첫 줄은 헤더
+            close = _num(row[4])
+            if close and close > 0:
+                return close
     except Exception as exc:
-        log(f"지수·환율 수집 실패: {exc}")
+        log(f"네이버 {symbol} 실패: {exc}")
+    return None
 
-    return result, fx
+
+def _fetch_naver_many(symbols, target, log):
+    out = {}
+    for s in symbols:
+        v = _fetch_naver_one(s, target, log)
+        if v:
+            out[s] = v
+        time.sleep(0.05)
+    return out
 
 
-# ------------------------------------------------------------------
-# 가상자산 (업비트)
-# ------------------------------------------------------------------
+# ==================================================================
+# 해외 · 환율 — Stooq CSV
+# ==================================================================
+def _stooq_symbol(ticker: str) -> str:
+    if ticker == "BENCH-SP500":
+        return "^spx"
+    return f"{ticker.lower()}.us"
+
+
+def _fetch_stooq_one(sym: str, target: date, log):
+    d1 = (target - timedelta(days=20)).strftime("%Y%m%d")
+    d2 = target.strftime("%Y%m%d")
+    url = f"https://stooq.com/q/d/l/?s={sym}&d1={d1}&d2={d2}&i=d"
+    try:
+        r = requests.get(url, headers={"User-Agent": UA}, timeout=TIMEOUT)
+        r.raise_for_status()
+        text = r.text.strip()
+        if not text or text.lower().startswith("no data"):
+            return None
+        lines = text.splitlines()
+        header = [h.strip().lower() for h in lines[0].split(",")]
+        if "close" not in header:
+            return None
+        ci = header.index("close")
+        for line in reversed(lines[1:]):
+            parts = line.split(",")
+            if len(parts) > ci:
+                v = _num(parts[ci])
+                if v and v > 0:
+                    return v
+    except Exception as exc:
+        log(f"Stooq {sym} 실패: {exc}")
+    return None
+
+
+def _fetch_overseas(tickers, target, log):
+    out = {}
+    for t in tickers:
+        v = _fetch_stooq_one(_stooq_symbol(t), target, log)
+        if v:
+            out[t] = v
+        time.sleep(0.05)
+    return out
+
+
+def _fetch_fx(target, log):
+    """원달러 환율. Stooq → 실패 시 네이버."""
+    v = _fetch_stooq_one("usdkrw", target, log)
+    if v:
+        return v
+    v = _fetch_naver_one("FX_USDKRW", target, log)
+    return v
+
+
+# ==================================================================
+# 가상자산 — 업비트
+# ==================================================================
 def _fetch_upbit(markets, target: date, log):
-    """KST 자정 마감 일봉의 종가를 가져온다."""
-    result = {}
+    out = {}
     to_param = f"{target.isoformat()}T23:59:59+09:00"
     for market in markets:
         try:
-            resp = requests.get(
-                "https://api.upbit.com/v1/candles/days",
-                params={"market": market, "to": to_param, "count": 1},
-                headers={"Accept": "application/json"},
-                timeout=10,
-            )
-            resp.raise_for_status()
-            rows = resp.json()
+            r = requests.get("https://api.upbit.com/v1/candles/days",
+                             params={"market": market, "to": to_param, "count": 1},
+                             headers={"Accept": "application/json", "User-Agent": UA},
+                             timeout=TIMEOUT)
+            r.raise_for_status()
+            rows = r.json()
             if rows:
-                result[market] = float(rows[0]["trade_price"])
+                out[market] = float(rows[0]["trade_price"])
         except Exception as exc:
-            log(f"{market} 수집 실패: {exc}")
-    return result
+            log(f"{market} 실패: {exc}")
+        time.sleep(0.05)
+    return out
 
 
-# ------------------------------------------------------------------
+# ==================================================================
 # 통합
-# ------------------------------------------------------------------
+# ==================================================================
 def fetch_all(target: date):
     """
-    모든 종목의 종가를 수집한다.
-
     반환: (rows, fx, logs, missing)
-        rows    : Supabase inv_pf_prices 에 그대로 넣을 dict 리스트
-        fx      : 원달러 환율 (float 또는 None)
-        logs    : 경고 메시지 리스트
-        missing : 수집 실패한 종목명 리스트
+        rows    : inv_pf_prices 에 넣을 dict 리스트
+        fx      : 원달러 환율
+        logs    : 경고 메시지
+        missing : 수집 실패 종목명
     """
     logs = []
-    def log(msg):
-        logs.append(msg)
+    log = logs.append
 
-    krx_codes = [t for t, _, c, _, _ in ALL_TICKERS if c in ("kr_stock", "kr_etf")]
-    us_tickers = [t for t, _, c, _, _ in ALL_TICKERS if c == "us"]
+    kr = [t for t, _, c, _, _ in ALL_TICKERS if c in ("kr_stock", "kr_etf")]
+    us = [t for t, _, c, _, _ in ALL_TICKERS if c == "us"]
     crypto = [t for t, _, c, _, _ in ALL_TICKERS if c == "crypto"]
 
     prices = {}
-    prices.update(_fetch_krx(krx_codes, target, log))
-    yh, fx = _fetch_yahoo(us_tickers, target, log)
-    prices.update(yh)
+
+    # 1) 국내 일괄
+    prices.update(_fetch_krx_bulk(target, log))
+
+    # 2) 빠진 국내 종목만 네이버로 보충
+    need = [t for t in kr if t not in prices]
+    want_kospi = "BENCH-KOSPI" not in prices
+    if need or want_kospi:
+        log(f"KRX에서 {len(need)}종목이 비어 네이버로 보충합니다.")
+        syms = need + (["KOSPI"] if want_kospi else [])
+        for k, v in _fetch_naver_many(syms, target, log).items():
+            prices["BENCH-KOSPI" if k == "KOSPI" else k] = v
+
+    # 3) 해외 + S&P500
+    prices.update(_fetch_overseas(us + ["BENCH-SP500"], target, log))
+
+    # 4) 가상자산
     prices.update(_fetch_upbit(crypto, target, log))
+
+    # 5) 환율
+    fx = _fetch_fx(target, log)
+    if not fx:
+        log("환율을 가져오지 못했습니다. 해외 종목 평가가 비어 있을 수 있습니다.")
 
     rows, missing = [], []
     for ticker, name, cls, _high, cur in ALL_TICKERS:
-        price = prices.get(ticker)
-        if price is None:
+        p = prices.get(ticker)
+        if p is None:
             missing.append(f"{name}({ticker})")
             continue
         rows.append({
             "ticker": ticker,
             "price_date": target.isoformat(),
-            "close_price": round(float(price), 4),
+            "close_price": round(float(p), 4),
             "fx_usdkrw": round(float(fx), 2) if fx else None,
         })
 

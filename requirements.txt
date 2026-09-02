@@ -1,6 +1,4 @@
 streamlit>=1.40
 pandas>=2.0
 supabase>=2.4
-pykrx>=1.0.45
-yfinance>=0.2.40
 requests>=2.31
