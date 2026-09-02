@@ -49,10 +49,12 @@ def _num(x):
 # ==================================================================
 # 국내 — KRX 전종목 일괄
 # ==================================================================
-KRX_URL = "http://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
+KRX_URL = "https://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
 KRX_HEADERS = {
     "User-Agent": UA,
-    "Referer": "http://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd",
+    "Referer": "https://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
     "X-Requested-With": "XMLHttpRequest",
 }
 
@@ -75,7 +77,7 @@ def _fetch_krx_bulk(target: date, log):
     jobs = [
         ({"bld": "dbms/MDC/STAT/standard/MDCSTAT01501", "mktId": "ALL",
           "trdDd": ymd, "share": "1", "money": "1", "csvxls_isNo": "false"}, "주식"),
-        ({"bld": "dbms/MDC/STAT/standard/MDCSTAT04301",
+        ({"bld": "dbms/MDC/STAT/standard/MDCSTAT04301", "mktId": "ALL",
           "trdDd": ymd, "share": "1", "money": "1", "csvxls_isNo": "false"}, "ETF"),
     ]
     for payload, tag in jobs:
@@ -139,16 +141,59 @@ def _fetch_naver_many(symbols, target, log):
 
 
 # ==================================================================
-# 해외 · 환율 — Stooq CSV
+# 해외 · 환율 — ① 야후 차트 API  ② Stooq CSV  ③ 네이버
+# ------------------------------------------------------------------
+# Stooq 는 클라우드 IP에서 빈 응답을 주는 경우가 있어 단독으로 쓰지 않는다.
 # ==================================================================
+YAHOO_HOSTS = ["https://query1.finance.yahoo.com",
+               "https://query2.finance.yahoo.com"]
+
+
+def _yahoo_symbol(ticker: str) -> str:
+    if ticker == "BENCH-SP500":
+        return "^GSPC"
+    if ticker == "FX-USDKRW":
+        return "KRW=X"
+    return ticker
+
+
+def _fetch_yahoo_one(ticker: str, target: date, log):
+    """야후 차트 API에서 기준일 이하 마지막 종가를 가져온다."""
+    sym = _yahoo_symbol(ticker)
+    p1 = int(time.mktime((target - timedelta(days=25)).timetuple()))
+    p2 = int(time.mktime((target + timedelta(days=1)).timetuple()))
+    for host in YAHOO_HOSTS:
+        url = (f"{host}/v8/finance/chart/{requests.utils.quote(sym, safe='')}"
+               f"?period1={p1}&period2={p2}&interval=1d")
+        try:
+            r = requests.get(url, headers={"User-Agent": UA,
+                                           "Accept": "application/json"},
+                             timeout=TIMEOUT)
+            if r.status_code != 200:
+                continue
+            res = (r.json().get("chart") or {}).get("result") or []
+            if not res:
+                continue
+            closes = (res[0].get("indicators", {})
+                      .get("quote", [{}])[0].get("close") or [])
+            for c in reversed(closes):
+                if c:
+                    return float(c)
+        except Exception as exc:
+            log(f"야후 {sym} 실패: {exc}")
+    return None
+
+
 def _stooq_symbol(ticker: str) -> str:
     if ticker == "BENCH-SP500":
         return "^spx"
+    if ticker == "FX-USDKRW":
+        return "usdkrw"
     return f"{ticker.lower()}.us"
 
 
 def _fetch_stooq_one(sym: str, target: date, log):
-    d1 = (target - timedelta(days=20)).strftime("%Y%m%d")
+    d1 = (target - timedelta(days=25)).strftime("%Y%m%d")
     d2 = target.strftime("%Y%m%d")
     url = f"https://stooq.com/q/d/l/?s={sym}&d1={d1}&d2={d2}&i=d"
     try:
@@ -174,22 +219,53 @@ def _fetch_stooq_one(sym: str, target: date, log):
 
 
 def _fetch_overseas(tickers, target, log):
-    out = {}
+    """야후 → Stooq 순으로 시도한다."""
+    out, failed = {}, []
     for t in tickers:
-        v = _fetch_stooq_one(_stooq_symbol(t), target, log)
+        v = _fetch_yahoo_one(t, target, log)
+        if v is None:
+            v = _fetch_stooq_one(_stooq_symbol(t), target, log)
         if v:
             out[t] = v
-        time.sleep(0.05)
+        else:
+            failed.append(t)
+        time.sleep(0.08)
+    if failed:
+        log(f"해외 {len(failed)}종목 수집 실패: {', '.join(failed)}")
     return out
 
 
+def _fetch_naver_fx(target, log):
+    """네이버 시장지표 환율 차트."""
+    s = (target - timedelta(days=20)).strftime("%Y%m%d") + "0000"
+    e = target.strftime("%Y%m%d") + "2359"
+    url = ("https://api.stock.naver.com/chart/marketindex/area"
+           f"?category=exchange&reutersCode=FX_USDKRW"
+           f"&startDateTime={s}&endDateTime={e}&type=day")
+    try:
+        r = requests.get(url, headers={"User-Agent": UA,
+                                       "Accept": "application/json"},
+                         timeout=TIMEOUT)
+        r.raise_for_status()
+        infos = r.json().get("priceInfos") or []
+        for row in reversed(infos):
+            v = _num(row.get("closePrice"))
+            if v and v > 0:
+                return v
+    except Exception as exc:
+        log(f"네이버 환율 실패: {exc}")
+    return None
+
+
 def _fetch_fx(target, log):
-    """원달러 환율. Stooq → 실패 시 네이버."""
-    v = _fetch_stooq_one("usdkrw", target, log)
+    """원달러 환율. 야후 → 네이버 → Stooq 순."""
+    v = _fetch_yahoo_one("FX-USDKRW", target, log)
     if v:
         return v
-    v = _fetch_naver_one("FX_USDKRW", target, log)
-    return v
+    v = _fetch_naver_fx(target, log)
+    if v:
+        return v
+    return _fetch_stooq_one("usdkrw", target, log)
 
 
 # ==================================================================
@@ -219,11 +295,12 @@ def _fetch_upbit(markets, target: date, log):
 # ==================================================================
 def fetch_all(target: date):
     """
-    반환: (rows, fx, logs, missing)
-        rows    : inv_pf_prices 에 넣을 dict 리스트
-        fx      : 원달러 환율
-        logs    : 경고 메시지
-        missing : 수집 실패 종목명
+    반환: (rows, fx, logs, missing, missing_tickers)
+        rows            : inv_pf_prices 에 넣을 dict 리스트
+        fx              : 원달러 환율 (실패 시 None)
+        logs            : 경고 메시지
+        missing         : 수집 실패 종목명 (사람이 읽는 용도)
+        missing_tickers : 수집 실패 티커 (수동 입력 UI 용도)
     """
     logs = []
     log = logs.append
@@ -257,11 +334,12 @@ def fetch_all(target: date):
     if not fx:
         log("환율을 가져오지 못했습니다. 해외 종목 평가가 비어 있을 수 있습니다.")
 
-    rows, missing = [], []
+    rows, missing, missing_tickers = [], [], []
     for ticker, name, cls, _high, cur in ALL_TICKERS:
         p = prices.get(ticker)
         if p is None:
             missing.append(f"{name}({ticker})")
+            missing_tickers.append(ticker)
             continue
         rows.append({
             "ticker": ticker,
@@ -270,4 +348,4 @@ def fetch_all(target: date):
             "fx_usdkrw": round(float(fx), 2) if fx else None,
         })
 
-    return rows, fx, logs, missing
+    return rows, fx, logs, missing, missing_tickers

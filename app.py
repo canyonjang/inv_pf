@@ -700,8 +700,17 @@ else:
     go = g2.button("📥 전일 종가 불러오기", type="primary", use_container_width=True)
 
     if go:
-        with st.spinner("시세를 불러오는 중입니다. 20~40초 걸립니다..."):
-            rows, fx, logs, missing = fetch_all(target)
+        with st.spinner("시세를 불러오는 중입니다. 30~60초 걸립니다..."):
+            rows, fx, logs, missing, missing_tk = fetch_all(target)
+
+        # 환율을 못 가져왔으면 가장 최근에 저장된 환율을 그대로 쓴다.
+        if not fx and not pdf.empty:
+            prev = pdf["fx_usdkrw"].dropna()
+            if len(prev):
+                fx = float(prev.iloc[-1])
+                logs.append(f"환율 수집 실패 → 직전 저장값 {fx:,.2f}원을 사용합니다.")
+                for r in rows:
+                    r["fx_usdkrw"] = round(fx, 2)
 
         if not rows:
             st.error("가져온 데이터가 없습니다. 기준일이 휴장일인지 확인하세요.")
@@ -735,9 +744,81 @@ else:
                        + (f" · 환율 {fx:,.2f}원" if fx else ""))
             if missing:
                 st.warning("수집 실패: " + ", ".join(missing))
+                st.session_state["missing_tickers"] = missing_tk
+                st.session_state["missing_date"] = target.isoformat()
+            else:
+                st.session_state.pop("missing_tickers", None)
             for l in logs:
                 st.caption(l)
             st.info("화면 상단의 [현황 새로고침]을 눌러 반영된 결과를 보세요.")
+
+    # ---------------- 수동 보정 (자동 수집 실패 시) ----------------
+    miss = st.session_state.get("missing_tickers") or []
+    with st.expander(f"✍️ 종가 직접 입력 {'· 보정 필요 ' + str(len(miss)) + '건' if miss else ''}",
+                     expanded=bool(miss)):
+        st.caption("자동 수집이 실패한 종목은 여기에 직접 넣으면 됩니다. "
+                   "네이버·야후에서 해당 날짜 종가를 보고 그대로 입력하세요. "
+                   "해외 종목은 **달러 가격 그대로** 넣으면 환율이 자동 적용됩니다.")
+
+        mdate = st.date_input("보정할 기준일", value=datetime.strptime(
+            st.session_state.get("missing_date", target.isoformat()),
+            "%Y-%m-%d").date(), key="mdate")
+
+        pool = miss if miss else TRADABLE + ["BENCH-KOSPI", "BENCH-SP500"]
+        chosen = st.multiselect("입력할 종목", pool, default=miss[:12],
+                                format_func=lambda t: SEC_MAP.get(t, {}).get("name", t),
+                                key="mtk")
+
+        cur_fx = None
+        if not pdf.empty:
+            fxs = pdf["fx_usdkrw"].dropna()
+            cur_fx = float(fxs.iloc[-1]) if len(fxs) else None
+        man_fx = st.number_input("원달러 환율 (해외 종목이 있으면 필수)",
+                                 0.0, 5000.0, float(cur_fx or 0.0), step=1.0,
+                                 key="mfx")
+
+        vals = {}
+        if chosen:
+            mc = st.columns(min(len(chosen), 3))
+            for i, t in enumerate(chosen):
+                unit = "USD" if SEC_MAP.get(t, {}).get("currency") == "USD" else "원"
+                vals[t] = mc[i % len(mc)].number_input(
+                    f"{SEC_MAP.get(t, {}).get('name', t)} ({unit})",
+                    0.0, 1e9, 0.0, step=0.01, format="%.4f", key=f"mv{t}")
+
+        if st.button("💾 입력한 종가 저장", type="primary", disabled=not chosen):
+            mrows = [{"ticker": t, "price_date": mdate.isoformat(),
+                      "close_price": float(v),
+                      "fx_usdkrw": float(man_fx) if man_fx else None}
+                     for t, v in vals.items() if v > 0]
+            if not mrows:
+                st.error("0보다 큰 값을 하나 이상 입력하세요.")
+            else:
+                supabase.table("inv_pf_prices").upsert(
+                    mrows, on_conflict="ticker,price_date").execute()
+                _q_prices.clear()
+
+                # 평가금액 다시 계산
+                pm2 = price_map_on(price_table(), mdate)
+                srows = []
+                for s in students:
+                    so = student_orders(all_orders, s["name"])
+                    if not so:
+                        continue
+                    q, csh = positions_from(so)
+                    _, tot = valuate(q, csh, pm2)
+                    srows.append({"class_name": my_class, "name": s["name"],
+                                  "price_date": mdate.isoformat(),
+                                  "total_value": round(tot, 4), "cash": round(csh, 4)})
+                if srows:
+                    supabase.table("inv_pf_snapshots").upsert(
+                        srows, on_conflict="class_name,name,price_date").execute()
+                set_status(my_class, last_price_date=mdate.isoformat())
+                st.session_state["missing_tickers"] = [
+                    t for t in miss if t not in {r["ticker"] for r in mrows}]
+                clear_all_cache()
+                st.success(f"{len(mrows)}건 저장 완료 · 평가금액 재계산")
+                st.rerun()
 
     st.write("---")
 
