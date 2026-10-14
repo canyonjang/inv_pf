@@ -228,7 +228,8 @@ if "role" not in st.session_state:
                 st.error("이름을 입력해주세요.")
             else:
                 rows = supabase.table("inv_pf_status").select("*").execute().data
-                active = [r["class_name"] for r in rows if r["phase"] != "대기"]
+                active = [r["class_name"] for r in rows
+                          if r["phase"] not in ("대기", "종료")]
                 if len(active) != 1:
                     st.error("열려 있는 강의실이 없거나 여러 곳이 동시에 열려 있습니다. "
                              "교수님께 문의하세요.")
