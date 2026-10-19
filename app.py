@@ -516,7 +516,51 @@ if st.session_state.role == "student":
                                     f"({n_hold}개).")
                     if not sum(sells.values()) and not spend:
                         errs.append("매매 내용이 없습니다. 거래하지 않으려면 위 체크박스를 선택하세요.")
+# --- 조정 후 예상 포트폴리오 ---
+                if not no_trade and etot > 0:
+                    st.write("")
+                    st.markdown("**조정 후 예상 포트폴리오**")
 
+                    cur_w = {r["ticker"]: (r["weight"] or 0) for r in rows}
+                    new_w = {r["ticker"]: (r["value"] / etot if r["value"] else 0)
+                             for r in er}
+
+                    prev_rows = []
+                    for t in sorted(set(cur_w) | set(new_w),
+                                    key=lambda x: -new_w.get(x, 0)):
+                        c = cur_w.get(t, 0) * 100
+                        n = new_w.get(t, 0) * 100
+                        if c < 0.01 and n < 0.01:
+                            continue
+                        d = n - c
+                        prev_rows.append({
+                            "종목": label(t),
+                            "지금 비중": f"{c:.1f}%" if c >= 0.01 else "—",
+                            "조정 후": f"{n:.1f}%" if n >= 0.01 else "전량 매도",
+                            "변화": f"{d:+.1f}%p" if abs(d) >= 0.05 else "—",
+                        })
+
+                    cash_c = (cash / total * 100) if total else 0.0
+                    cash_n = (est_cash / etot * 100) if etot else 0.0
+                    prev_rows.append({
+                        "종목": "현금",
+                        "지금 비중": f"{cash_c:.1f}%",
+                        "조정 후": f"{cash_n:.1f}%",
+                        "변화": (f"{cash_n - cash_c:+.1f}%p"
+                                 if abs(cash_n - cash_c) >= 0.05 else "—"),
+                    })
+
+                    st.dataframe(pd.DataFrame(prev_rows),
+                                 use_container_width=True, hide_index=True)
+
+                    hr_new = sum(r["value"] or 0 for r in er if is_high_risk(r["ticker"]))
+                    st.caption(
+                        f"조정 후 보유 종목 {len([r for r in er if r['value']])}개 "
+                        f"(허용 {MIN_HOLDINGS}~{MAX_HOLDINGS}개) · "
+                        f"고위험 {hr_new / etot * 100:.1f}% (상한 20%) · "
+                        f"예상 현금 {est_cash:,.1f}만원")
+                    st.caption("※ 현재가 기준 추정입니다. 실제 체결가는 다음 종가라 "
+                               "최종 비중은 조금 달라집니다.")
                 reason = st.text_area(
                     "이 결정을 내린 이유를 적어주세요. *(필수 · 거래하지 않는 것도 결정입니다)*",
                     height=120, key=f"why{rnd}")
