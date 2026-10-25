@@ -1203,7 +1203,54 @@ else:
                          use_container_width=True, hide_index=True)
             st.caption("이 표는 교수 화면에만 나타납니다. 학생 화면에는 순위가 없습니다.")
 
-    # ---------------- 라운드별 기록 열람 ----------------
+    # ---------------- 학생 개인 포트폴리오 들여다보기 ----------------
+    st.write("---")
+    with st.expander("🔎 학생별 보유 종목 · 종목별 수익률"):
+        st.caption("학생 화면에 보이는 것과 똑같은 표입니다. "
+                   "누가 어떤 종목에서 벌고 잃었는지 확인하실 수 있습니다.")
+        names_all = sorted({s["name"] for s in students})
+        if not names_all:
+            st.caption("등록된 학생이 없습니다.")
+        else:
+            who = st.selectbox("학생 선택", names_all, key="peek")
+            so = student_orders(all_orders, who)
+            q_, c_ = positions_from(so)
+            rows_, tot_ = valuate(q_, c_, pmap_now)
+            avgs_ = avg_costs(so)
+
+            mm1, mm2, mm3 = st.columns(3)
+            mm1.metric("평가금액", f"{tot_:,.1f} 만원",
+                       delta=f"{tot_ - INITIAL_CAPITAL:+,.1f} 만원")
+            mm2.metric("수익률", f"{(tot_ / INITIAL_CAPITAL - 1) * 100:+.2f} %")
+            mm3.metric("현금", f"{c_:,.1f} 만원")
+
+            if not rows_:
+                st.info("보유 종목이 없습니다. (최초 매수 미제출이거나 전량 매도)")
+            else:
+                prows = []
+                for r in rows_:
+                    t, px = r["ticker"], r["price"]
+                    avg = avgs_.get(t)
+                    if avg and px:
+                        pl_s = f"{r['qty'] * (px - avg) / 10000:+,.1f}"
+                        rp_s = f"{(px / avg - 1) * 100:+.2f}%"
+                    else:
+                        pl_s = rp_s = "—"
+                    prows.append({
+                        "종목": label(t),
+                        "수익률": rp_s,
+                        "평가손익(만원)": pl_s,
+                        "평균매입가(원)": f"{avg:,.0f}" if avg else "—",
+                        "현재가(원)": f"{px:,.0f}" if px else "—",
+                        "평가액(만원)": f"{r['value']:,.1f}" if r["value"] else "—",
+                        "비중": f"{r['weight'] * 100:.1f}%" if r["weight"] else "—",
+                    })
+                st.dataframe(pd.DataFrame(prows),
+                             use_container_width=True, hide_index=True)
+                st.caption("이미 판 종목의 손익은 이 표에 없고 위 수익률에만 "
+                           "반영되어 있습니다.")
+             
+ # ---------------- 라운드별 기록 열람 ----------------
     st.write("---")
     with st.expander("💬 라운드별 학생 기록 (심정 · 이유)"):
         rsel = st.selectbox("라운드 선택", TRADING_ROUNDS, key="rsel")
