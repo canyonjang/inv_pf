@@ -186,6 +186,39 @@ def positions_from(orders, upto_round=None):
     return qty, round(cash, 4)
 
 
+def avg_costs(orders, upto_round=None):
+    """체결된 주문에서 종목별 평균 매입단가(원)를 구한다.
+
+    이동평균법: 매수하면 평균단가가 섞이고, 매도는 평균단가를 바꾸지 않고
+    수량과 원가를 같은 비율로 줄인다. 미체결·취소 주문은 제외한다.
+    읽기 전용이며 DB에 아무것도 쓰지 않는다.
+    """
+    qty, cost = {}, {}
+    for o in sorted(orders, key=lambda x: (x["round_no"], x["id"])):
+        if o.get("status") != "executed":
+            continue
+        if upto_round is not None and o["round_no"] > upto_round:
+            continue
+        t = o["ticker"]
+        q = float(o.get("exec_qty") or 0)
+        px = float(o.get("exec_price_krw") or 0)
+        if q <= 0 or px <= 0:
+            continue
+        if o["side"] == "buy":
+            qty[t] = qty.get(t, 0.0) + q
+            cost[t] = cost.get(t, 0.0) + q * px
+        else:
+            held = qty.get(t, 0.0)
+            if held <= 1e-12:
+                continue
+            unit = cost.get(t, 0.0) / held
+            sold = min(q, held)
+            qty[t] = held - sold
+            cost[t] = cost.get(t, 0.0) - sold * unit
+    return {t: cost[t] / qty[t] for t in qty
+            if qty[t] > 1e-9 and cost.get(t, 0.0) > 0}
+
+
 def valuate(qty, cash, pmap):
     """보유수량을 특정 시점 가격으로 평가한다. (단위: 만원)"""
     rows, total = [], float(cash)
@@ -324,14 +357,32 @@ if st.session_state.role == "student":
         m3.metric("현금", f"{cash:,.1f} 만원")
 
         if rows:
-            disp = pd.DataFrame([{
-                "종목": label(r["ticker"]),
-                "수량": f"{r['qty']:,.4f}".rstrip("0").rstrip("."),
-                "현재가(원)": f"{r['price']:,.0f}" if r["price"] else "—",
-                "평가액(만원)": f"{r['value']:,.1f}" if r["value"] else "—",
-                "비중": f"{r['weight']*100:.1f}%" if r["weight"] else "—",
-            } for r in rows])
-            st.dataframe(disp, use_container_width=True, hide_index=True)
+            avgs = avg_costs(my_orders)
+            disp_rows = []
+            for r in rows:
+                t, px = r["ticker"], r["price"]
+                avg = avgs.get(t)
+                if avg and px:
+                    pl = r["qty"] * (px - avg) / 10000      # 평가손익 (만원)
+                    rp = (px / avg - 1) * 100               # 종목 수익률 (%)
+                    pl_s, rp_s = f"{pl:+,.1f}", f"{rp:+.2f}%"
+                else:
+                    pl_s = rp_s = "—"
+                disp_rows.append({
+                    "종목": label(t),
+                    "수익률": rp_s,
+                    "평가손익(만원)": pl_s,
+                    "평균매입가(원)": f"{avg:,.0f}" if avg else "—",
+                    "현재가(원)": f"{px:,.0f}" if px else "—",
+                    "평가액(만원)": f"{r['value']:,.1f}" if r["value"] else "—",
+                    "비중": f"{r['weight']*100:.1f}%" if r["weight"] else "—",
+                    "수량": f"{r['qty']:,.4f}".rstrip("0").rstrip("."),
+                })
+            st.dataframe(pd.DataFrame(disp_rows),
+                         use_container_width=True, hide_index=True)
+            st.caption("표의 수익률은 **지금 들고 있는 종목**의 평가손익입니다. "
+                       "이미 판 종목에서 얻거나 잃은 금액은 위의 전체 수익률에 "
+                       "이미 반영되어 있습니다.")
             hr = sum(r["value"] or 0 for r in rows if is_high_risk(r["ticker"]))
             st.caption(f"고위험자산 비중 {hr/total*100:.1f}% (상한 20%) · "
                        f"현금 비중 {cash/total*100:.1f}% · "
