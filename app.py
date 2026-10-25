@@ -902,7 +902,7 @@ else:
             if missing:
                 st.warning("수집 실패: " + ", ".join(missing))
             for l in logs:
-                st.caption(l)
+                (st.warning if l.startswith("⚠") else st.caption)(l)
             st.info("화면 상단의 [현황 새로고침]을 눌러 반영된 결과를 보세요.")
 
     # ---------------- 수동 보정 (자동 수집 실패 시) ----------------
