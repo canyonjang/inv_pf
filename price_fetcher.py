@@ -199,6 +199,7 @@ def _fetch_yahoo_one(ticker: str, target: date, log):
                                            "Accept": "application/json"},
                              timeout=TIMEOUT)
             if r.status_code != 200:
+                log(f"야후 {sym} 응답코드 {r.status_code}")
                 continue
             res = (r.json().get("chart") or {}).get("result") or []
             if not res:
@@ -269,9 +270,11 @@ def _fetch_stooq_one(sym: str, target: date, log):
 def _fetch_overseas(tickers, target, log):
     """야후 → Stooq 순으로 시도하고, 실제 거래일도 함께 모은다."""
     out, dates, failed = {}, {}, []
+    yahoo_fail = 0
     for t in tickers:
         v, d = _fetch_yahoo_one(t, target, log)
         if v is None:
+            yahoo_fail += 1
             v, d = _fetch_stooq_one(_stooq_symbol(t), target, log)
         if v:
             out[t] = v
@@ -280,6 +283,10 @@ def _fetch_overseas(tickers, target, log):
         else:
             failed.append(t)
         time.sleep(0.08)
+    if yahoo_fail:
+        log(f"⚠ 야후에서 {yahoo_fail}종목을 받지 못해 Stooq로 대체했습니다. "
+            "Stooq는 미국 종가가 하루 늦게 올라오는 경우가 있으니 "
+            "아래 [종가 직접 입력]으로 보정하십시오.")
     if failed:
         log(f"해외 {len(failed)}종목 수집 실패: {', '.join(failed)}")
     return out, dates
@@ -413,10 +420,11 @@ def fetch_all(target: date):
     _stale_note(us_dates, "해외 종목")
 
     if us_dates and any(d and d < target for d in us_dates.values()):
-        log("⚠ 미국 종가는 한국시간 기준 **다음 날 아침 7시 이후**에 확정됩니다. "
-            f"{target} 종가가 필요하면 "
-            f"{(target + timedelta(days=1)).isoformat()} 오전 7시 이후에 "
-            "같은 날짜로 다시 불러오시면 덮어써집니다.")
+        log(f"⚠ 미국 종가는 한국시간 기준 {(target + timedelta(days=1)).isoformat()} "
+            "아침 7시 이후에 확정됩니다. 아직 그 전이라면 조금 뒤 같은 날짜로 "
+            "다시 불러오시면 덮어써집니다. 이미 그 시각이 지났는데도 날짜가 "
+            "맞지 않으면 데이터 출처가 아직 갱신하지 않은 것이니, "
+            "[종가 직접 입력]으로 보정하십시오.")
 
     if fx and fx_date and fx_date != target:
         log(f"⚠ 환율이 {target} 가 아니라 {fx_date} 값입니다.")
