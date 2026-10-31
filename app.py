@@ -1124,11 +1124,16 @@ else:
                          "평가금액": round(vals[-1], 1)})
         perf = pd.DataFrame(recs)
 
-        # --- 벤치마크 ---
+# --- 벤치마크 : 이 분반의 투자 시작일 → 이 분반의 기준가 일자 ---
+        # 종가 테이블(inv_pf_prices)은 세 분반이 공유하므로, 전체 최초 날짜를
+        # 쓰면 다른 분반이 먼저 시작한 날부터 계산되어 구간이 어긋난다.
+        # 이 분반의 가장 이른 스냅샷 날짜를 시작점으로 삼는다.
         bench_txt = []
-        dates = available_dates(pdf)
-        if len(dates) >= 2:
-            d0, d1 = dates[0], dates[-1]
+        all_dates = available_dates(pdf)
+        snap_dates = sorted({pd.to_datetime(x["price_date"]).date() for x in snaps})
+        d0 = snap_dates[0] if snap_dates else (all_dates[0] if all_dates else None)
+        d1 = last_pd or (all_dates[-1] if all_dates else None)
+        if d0 and d1 and d0 < d1:
             for bt, bname in [("BENCH-KOSPI", "코스피"), ("BENCH-SP500", "S&P500")]:
                 a = pdf[(pdf.ticker == bt) & (pdf.price_date == d0)]["close_price"]
                 b = pdf[(pdf.ticker == bt) & (pdf.price_date == d1)]["close_price"]
@@ -1141,7 +1146,11 @@ else:
                                 f"{perf['수익률(%)'].min():+.1f} %")
         k3.metric("손실 학생", f"{int((perf['수익률(%)'] < 0).sum())} / {len(perf)} 명")
         k4.metric("벤치마크", " · ".join(bench_txt) if bench_txt else "—")
-
+        if bench_txt:
+            st.caption(f"벤치마크 기간: **{d0} → {d1}** — 이 분반의 투자 시작일부터 "
+                       "현재 기준가 일자까지입니다. 분반마다 시작일이 다르므로 "
+                       "다른 분반 숫자와 직접 비교하지 마세요.")
+         
         tab1, tab2, tab3, tab4 = st.tabs(
             ["익명 산점도", "수익률 분포", "매매 행태", "학생별 표"])
 
